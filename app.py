@@ -107,29 +107,161 @@ def load_fred_series(api_key: str, series_id: str, start_date: date, end_date: d
     df = df.dropna(subset=["value"])
     return df[["date", "value"]]
 
-def normalize_flow_csv(uploaded) -> tuple[pd.DataFrame | None, str | None]:
+
+def normalize_flow_csv(uploaded):
+    """표준 CSV와 KRX 가로형 순매수 CSV를 표준 형식으로 변환한다."""
     try:
-        raw = pd.read_csv(uploaded)
+        uploaded.seek(0)
+        try:
+            raw = pd.read_csv(uploaded, encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            uploaded.seek(0)
+            raw = pd.read_csv(uploaded, encoding="cp949")
     except Exception as e:
         return None, f"CSV를 읽을 수 없습니다: {e}"
-    lookup = {str(c).strip().lower(): c for c in raw.columns}
-    date_col = next((lookup[k] for k in ["date", "날짜", "일자", "trading_date"] if k in lookup), None)
-    investor_col = next((lookup[k] for k in ["investor", "투자자", "투자자구분", "주체"] if k in lookup), None)
-    value_col = next((lookup[k] for k in ["net_buy", "순매수", "순매수금액", "순매수대금", "순매수량"] if k in lookup), None)
-    market_col = next((lookup[k] for k in ["market", "시장", "상품", "구분"] if k in lookup), None)
-    if not (date_col and investor_col and value_col):
-        return None, "열 이름을 인식하지 못했습니다. 최소한 date, investor, net_buy 열이 필요합니다."
-    rename = {date_col: "date", investor_col: "investor", value_col: "net_buy"}
-    if market_col:
-        rename[market_col] = "market"
-    df = raw.rename(columns=rename)
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["net_buy"] = pd.to_numeric(df["net_buy"].astype(str).str.replace(",", "", regex=False), errors="coerce")
+
+    raw.columns = [str(c).strip() for c in raw.columns]
+
+    # 날짜 열 찾기
+    date_col = next(
+        (c for c in raw.columns
+         if c.strip().lower() in [
+             "date", "날짜", "일자", "거래일", "trading_date"
+         ]),
+        None,
+    )
+    if date_col is None:
+        return None, f"날짜 열을 찾지 못했습니다: {list(raw.columns)}"
+
+    # 표준형 CSV: date, investor, net_buy, market
+    investor_col = next(
+        (c for c in raw.columns
+         if c.strip().lower() in [
+             "investor", "투자자", "투자자구분", "주체"
+         ]),
+        None,
+    )
+    value_col = next(
+        (c for c in raw.columns
+         if c.strip().lower() in [
+             "net_buy", "순매수", "순매수금액", "순매수대금"
+         ]),
+        None,
+    )
+    market_col = next(
+        (c for c in raw.columns
+         if c.strip().lower() in ["market", "시장", "시장구분"]),
+        None,
+    )
+
+    if investor_col and value_col:
+        df = raw.rename(columns={
+            date_col: "date",
+            investor_col: "investor",
+            value_col: "net_buy",
+        }).copy()
+
+        if market_col:
+            df = df.rename(columns={market_col: "market"})
+        else:
+            df["market"] = "미분류"
+
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df["net_buy"] = pd.to_numeric(
+            df["net_buy"].astype(str).str.replace(",", "", regex=False),
+            errors="coerce",
+        )
+        df = df.dropna(subset=["date", "net_buy"])
+        df["investor"] = df["investor"].astype(str).str.strip()
+        return df[["date", "investor", "net_buy", "market"]], None
+
+    # KRX 가로형 CSV 처리
+    # 이번 원본은 순매수·십억원 단위이므로 원 단위로 변환한다.
+    required = ["외국인", "개인"]
+    missing = [c for c in required if c not in raw.columns]
+    if missing:
+        return None, (
+            "KRX 가로형 파일의 필수 열을 찾지 못했습니다: "
+            f"{missing}. 실제 열: {list(raw.columns)}"
+        )
+
+    numeric_columns = [
+        "금융투자", "보험", "투신", "사모", "은행",
+        "기타금융", "연기금 등", "외국인", "개인",
+        "기타법인", "기타외국인",
+    ]
+
+    # 숫자 변환
+    for col in numeric_columns:
+        if col in raw.columns:
+            raw[col] = pd.to_numeric(
+                raw[col].astype(str)
+                .str.replace(",", "", regex=False)
+                .str.strip(),
+                errors="coerce",
+            )
+
+    dates = pd.to_datetime(raw[date_col], errors="coerce")
+    if dates.isna().any():
+        return None, "날짜를 해석할 수 없는 행이 있습니다."
+
+    # 기관계는 기관 투자자 세부 항목을 합산한다.
+    institution_columns = [
+        c for c in [
+            "금융투자", "보험", "투신", "사모",
+            "은행", "기타금융", "연기금 등",
+        ]
+        if c in raw.columns
+    ]
+    if not institution_columns:
+        return None, "기관계 합산에 필요한 투자자 열이 없습니다."
+
+    # 기관 세부 열 중 값이 비어 있으면 누락 가능성이 있으므로 중단한다.
+    if raw[institution_columns].isna().any().any():
+        return None, (
+            "기관 세부 열에 숫자가 아닌 값 또는 빈칸이 있습니다. "
+            "원본 파일을 확인해 주세요."
+        )
+
+    # KRX 화면에서 선택한 단위가 십억원이므로 원 단위로 변환
+    multiplier = 1_000_000_000
+
+    institution_net = raw[institution_columns].sum(axis=1)
+
+    parts = [
+        pd.DataFrame({
+            "date": dates,
+            "investor": "외국인",
+            "net_buy": raw["외국인"] * multiplier,
+            "market": "KOSPI",
+        }),
+        pd.DataFrame({
+            "date": dates,
+            "investor": "기관계",
+            "net_buy": institution_net * multiplier,
+            "market": "KOSPI",
+        }),
+        pd.DataFrame({
+            "date": dates,
+            "investor": "개인",
+            "net_buy": raw["개인"] * multiplier,
+            "market": "KOSPI",
+        }),
+    ]
+
+    # 별도 분류는 기관계/외국인에 중복 합산하지 않는다.
+    for col in ["기타법인", "기타외국인"]:
+        if col in raw.columns:
+            parts.append(pd.DataFrame({
+                "date": dates,
+                "investor": col,
+                "net_buy": raw[col] * multiplier,
+                "market": "KOSPI",
+            }))
+
+    df = pd.concat(parts, ignore_index=True)
     df = df.dropna(subset=["date", "net_buy"])
-    df["investor"] = df["investor"].astype(str).str.strip()
-    if "market" not in df:
-        df["market"] = "미분류"
-    df["market"] = df["market"].astype(str).str.strip()
+
     return df, None
 
 def sentiment_score(rows: list[dict], flow_df: pd.DataFrame | None):
